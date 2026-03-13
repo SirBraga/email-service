@@ -104,6 +104,14 @@ async function handleRequest(req, res) {
       return await handleGetStats(req, res);
     }
 
+    if (path === "/api/webhooks/register" && method === "POST") {
+      return await handleRegisterWebhook(req, res);
+    }
+
+    if (path === "/api/webhooks/unregister" && method === "POST") {
+      return await handleUnregisterWebhook(req, res);
+    }
+
     sendJson(res, 404, { error: "Not found" });
   } catch (error) {
     log.error({ error: error.message, path, method }, "Erro na requisição HTTP");
@@ -402,6 +410,73 @@ async function handleGetStats(req, res) {
     todayEmails,
     unreadEmails,
   });
+}
+
+// Armazena os webhooks registrados
+const webhooks = new Set();
+
+async function handleRegisterWebhook(req, res) {
+  const body = await parseBody(req);
+  const { url, userId } = body;
+
+  if (!url || typeof url !== "string") {
+    return sendJson(res, 400, { error: "URL do webhook é obrigatória" });
+  }
+
+  const webhookKey = `${userId || "anonymous"}:${url}`;
+  webhooks.add(webhookKey);
+
+  log.info({ url, userId }, "Webhook registrado");
+  sendJson(res, 200, { success: true, registered: webhooks.size });
+}
+
+async function handleUnregisterWebhook(req, res) {
+  const body = await parseBody(req);
+  const { url, userId } = body;
+
+  if (!url || typeof url !== "string") {
+    return sendJson(res, 400, { error: "URL do webhook é obrigatória" });
+  }
+
+  const webhookKey = `${userId || "anonymous"}:${url}`;
+  webhooks.delete(webhookKey);
+
+  log.info({ url, userId }, "Webhook desregistrado");
+  sendJson(res, 200, { success: true, registered: webhooks.size });
+}
+
+export async function notifyNewEmail(emailData) {
+  if (webhooks.size === 0) return;
+
+  const payload = {
+    type: "new_email",
+    timestamp: new Date().toISOString(),
+    email: {
+      id: emailData.id,
+      subject: emailData.subject,
+      from: emailData.from,
+      receivedAt: emailData.receivedAt,
+      hasAttachments: emailData.hasAttachments,
+    },
+  };
+
+  const promises = Array.from(webhooks).map(async (webhookKey) => {
+    const url = webhookKey.split(":")[1];
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!response.ok) {
+        log.warn({ url, status: response.status }, "Falha ao notificar webhook");
+      }
+    } catch (error) {
+      log.error({ url, error: error.message }, "Erro ao notificar webhook");
+    }
+  });
+
+  await Promise.allSettled(promises);
 }
 
 export function createHttpServer() {
