@@ -11,12 +11,14 @@
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.879.0",
+    "@prisma/adapter-pg": "^7.5.0",
     "@prisma/client": "^7.5.0",
     "@prisma/config": "^7.5.0",
     "dotenv": "^17.2.3",
     "imapflow": "^1.1.1",
     "mailparser": "^3.7.5",
     "nodemailer": "^6.10.1",
+    "pg": "^8.16.3",
     "pino": "^9.9.0",
     "pino-pretty": "^13.1.2"
   },

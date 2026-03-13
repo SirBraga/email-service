@@ -1,5 +1,6 @@
+import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@prisma/client";
-import { isDatabaseEnabled } from "../config/env.js";
+import { env, isDatabaseEnabled } from "../config/env.js";
 import { logger } from "./logger.js";
 
 let prisma = null;
@@ -15,7 +16,11 @@ export async function connectPrisma() {
   }
 
   try {
-    prisma = new PrismaClient();
+    const adapter = new PrismaPg({
+      connectionString: env.DATABASE_URL,
+    });
+
+    prisma = new PrismaClient({ adapter });
     await prisma.$connect();
     logger.info("Conexão com banco de dados estabelecida");
     return prisma;
