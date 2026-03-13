@@ -7,14 +7,15 @@ RUN apk add --no-cache openssl
 
 # Copiar arquivos de dependências
 COPY package*.json ./
-COPY prisma ./prisma/
-COPY prisma.config.ts ./
 
 # Instalar dependências
 RUN npm ci --only=production
 
+# Copiar schema do Prisma
+COPY prisma ./prisma/
+
 # Gerar Prisma Client
-RUN npx prisma generate
+RUN npx prisma generate --schema=./prisma/schema.prisma
 
 # Copiar código fonte
 COPY src ./src
