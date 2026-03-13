@@ -308,9 +308,18 @@ export function createImapWorker() {
 
   return {
     async start() {
-      stopped = false;
-      await loadState();
-      await run();
+      try {
+        stopped = false;
+        await loadState();
+        await run();
+      } catch (error) {
+        log.error({
+          message: error?.message ?? "Erro ao iniciar worker",
+          code: error?.code ?? null,
+          stack: error?.stack ?? null,
+        }, "Falha ao iniciar worker IMAP");
+        throw error;
+      }
     },
     async stop() {
       stopped = true;

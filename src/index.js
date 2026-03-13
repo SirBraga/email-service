@@ -26,7 +26,13 @@ process.on("SIGTERM", () => {
 });
 
 main().catch((error) => {
-  logger.error({ error }, "Falha fatal ao iniciar email-service");
+  logger.error({
+    message: error?.message ?? "Erro desconhecido",
+    stack: error?.stack ?? "Stack trace não disponível",
+    code: error?.code ?? null,
+    name: error?.name ?? null,
+    cause: error?.cause ?? null,
+  }, "Falha fatal ao iniciar email-service");
   void disconnectPrisma().finally(() => {
     process.exit(1);
   });

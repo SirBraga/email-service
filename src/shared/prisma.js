@@ -14,10 +14,19 @@ export async function connectPrisma() {
     return prisma;
   }
 
-  prisma = new PrismaClient();
-  await prisma.$connect();
-  logger.info("Conexão com banco de dados estabelecida");
-  return prisma;
+  try {
+    prisma = new PrismaClient();
+    await prisma.$connect();
+    logger.info("Conexão com banco de dados estabelecida");
+    return prisma;
+  } catch (error) {
+    logger.error({
+      message: error?.message ?? "Erro ao conectar no banco",
+      code: error?.code ?? null,
+      meta: error?.meta ?? null,
+    }, "Falha na conexão com banco de dados");
+    throw error;
+  }
 }
 
 export function getPrismaClient() {
