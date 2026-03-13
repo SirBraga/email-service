@@ -11,7 +11,8 @@ COPY package*.json ./
 # Instalar dependências
 RUN npm ci --only=production
 
-# Copiar schema do Prisma
+# Copiar configuração e schema do Prisma
+COPY prisma.config.ts ./
 COPY prisma ./prisma/
 
 # Gerar Prisma Client
