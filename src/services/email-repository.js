@@ -100,3 +100,54 @@ export async function persistEmail(emailRecord) {
 
   return { persisted: true, skipped: false, emailId: email.id };
 }
+
+export async function findExistingEmail(mailbox, uid) {
+  if (!isDatabaseEnabled()) {
+    return null;
+  }
+
+  const prisma = getPrismaClient();
+  if (!prisma) {
+    return null;
+  }
+
+  return prisma.emailMessage.findUnique({
+    where: {
+      mailbox_uid: {
+        mailbox,
+        uid,
+      },
+    },
+    include: {
+      attachments: true,
+    },
+  });
+}
+
+export async function findLatestPersistedEmail(mailbox) {
+  if (!isDatabaseEnabled()) {
+    return null;
+  }
+
+  const prisma = getPrismaClient();
+  if (!prisma) {
+    return null;
+  }
+
+  return prisma.emailMessage.findFirst({
+    where: {
+      mailbox,
+    },
+    orderBy: [
+      { uid: "desc" },
+      { receivedAt: "desc" },
+    ],
+    select: {
+      id: true,
+      uid: true,
+      messageId: true,
+      receivedAt: true,
+      sentAt: true,
+    },
+  });
+}

@@ -32,9 +32,13 @@ export async function sendEmail(input) {
   return transport.sendMail({
     from: env.MAIL_FROM,
     to: input.to,
+    cc: input.cc || undefined,
+    bcc: input.bcc || undefined,
+    replyTo: input.replyTo || undefined,
     subject: input.subject,
     text: input.text,
     html: input.html,
+    attachments: input.attachments || undefined,
   });
 }
 

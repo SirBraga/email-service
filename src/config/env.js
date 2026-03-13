@@ -25,6 +25,7 @@ function parseNumber(value, fallback) {
 export const env = {
   NODE_ENV: process.env.NODE_ENV ?? "development",
   LOG_LEVEL: process.env.LOG_LEVEL ?? "info",
+  HTTP_PORT: parseNumber(process.env.HTTP_PORT, 3010),
   DATABASE_URL: process.env.DATABASE_URL ?? "",
   IMAP_HOST: requireEnv("IMAP_HOST"),
   IMAP_PORT: parseNumber(process.env.IMAP_PORT, 993),
@@ -33,7 +34,7 @@ export const env = {
   IMAP_PASS: requireEnv("IMAP_PASS"),
   IMAP_MAILBOX: process.env.IMAP_MAILBOX ?? "INBOX",
   IMAP_MAX_IDLE_TIME_MS: parseNumber(process.env.IMAP_MAX_IDLE_TIME_MS, 240000),
-  IMAP_RESYNC_INTERVAL_MS: parseNumber(process.env.IMAP_RESYNC_INTERVAL_MS, 300000),
+  IMAP_RESYNC_INTERVAL_MS: parseNumber(process.env.IMAP_RESYNC_INTERVAL_MS, 600000),
   IMAP_RECONNECT_INITIAL_DELAY_MS: parseNumber(process.env.IMAP_RECONNECT_INITIAL_DELAY_MS, 2000),
   IMAP_RECONNECT_MAX_DELAY_MS: parseNumber(process.env.IMAP_RECONNECT_MAX_DELAY_MS, 60000),
   EMAIL_ATTACHMENTS_DIR: process.env.EMAIL_ATTACHMENTS_DIR ?? "data/attachments",

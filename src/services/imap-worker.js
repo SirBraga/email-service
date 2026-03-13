@@ -3,7 +3,7 @@ import { simpleParser } from "mailparser";
 import { env } from "../config/env.js";
 import { logger } from "../shared/logger.js";
 import { prepareAttachments, readState, writeState } from "./message-store.js";
-import { persistEmail } from "./email-repository.js";
+import { findExistingEmail, findLatestPersistedEmail, persistEmail } from "./email-repository.js";
 import { uploadAttachments } from "./storage-service.js";
 import { dispatchEmailWebhook, isWebhookEnabled } from "./webhook-dispatcher.js";
 
@@ -17,7 +17,6 @@ export function createImapWorker() {
   let lastUid = 0;
   let processedUids = new Set();
   let processingRangePromise = null;
-  const recentWindowSize = 10;
 
   const log = logger.child({ scope: "imap-worker" });
 
@@ -37,6 +36,23 @@ export function createImapWorker() {
       .sort((a, b) => a - b);
 
     await writeState({ lastUid, processedUids: normalized });
+  }
+
+  async function resolveSyncCursor() {
+    const latestPersistedEmail = await findLatestPersistedEmail(env.IMAP_MAILBOX);
+    const latestPersistedUid = Number(latestPersistedEmail?.uid ?? 0);
+    const resolvedLastUid = Math.max(lastUid, latestPersistedUid);
+
+    if (resolvedLastUid !== lastUid) {
+      lastUid = resolvedLastUid;
+      await persistState();
+    }
+
+    return {
+      latestPersistedEmail,
+      latestPersistedUid,
+      resolvedLastUid,
+    };
   }
 
   function getReconnectDelay() {
@@ -89,6 +105,79 @@ export function createImapWorker() {
     }, "Worker IMAP conectado");
   }
 
+  function buildAttachmentFingerprint(attachment) {
+    return [
+      attachment.filename ?? attachment.storedFilename ?? "",
+      attachment.storedFilename ?? "",
+      attachment.contentType ?? "",
+      Number(attachment.size ?? 0),
+      attachment.checksum ?? "",
+      attachment.contentId ?? "",
+    ].join("::");
+  }
+
+  function normalizeExistingAttachment(attachment) {
+    return {
+      filename: attachment.filename,
+      storedFilename: attachment.storedFilename,
+      contentType: attachment.contentType,
+      size: attachment.size,
+      contentDisposition: attachment.contentDisposition ?? null,
+      contentId: attachment.contentId ?? null,
+      checksum: attachment.checksum ?? null,
+      localRelativePath: attachment.localRelativePath ?? null,
+      localAbsolutePath: attachment.localAbsolutePath ?? null,
+      storageProvider: attachment.storageProvider ?? null,
+      storageBucket: attachment.storageBucket ?? null,
+      storageKey: attachment.storageKey ?? null,
+      storageUrl: attachment.storageUrl ?? null,
+      storageEtag: attachment.storageEtag ?? null,
+    };
+  }
+
+  async function resolvePersistedAttachments(uid, attachments) {
+    if (!attachments.length) {
+      return [];
+    }
+
+    const existingEmail = await findExistingEmail(env.IMAP_MAILBOX, uid);
+    const existingAttachments = existingEmail?.attachments ?? [];
+    const existingByFingerprint = new Map(
+      existingAttachments.map((attachment) => [buildAttachmentFingerprint(attachment), attachment]),
+    );
+
+    const reused = [];
+    const pendingUpload = [];
+
+    for (const attachment of attachments) {
+      const fingerprint = buildAttachmentFingerprint(attachment);
+      const existingAttachment = existingByFingerprint.get(fingerprint);
+
+      if (existingAttachment) {
+        reused.push(normalizeExistingAttachment(existingAttachment));
+        continue;
+      }
+
+      pendingUpload.push(attachment);
+    }
+
+    const uploaded = await uploadAttachments({
+      mailbox: env.IMAP_MAILBOX,
+      uid,
+      attachments: pendingUpload,
+    });
+
+    if (reused.length > 0) {
+      log.info({
+        uid,
+        reused: reused.length,
+        uploaded: uploaded.length,
+      }, "Anexos existentes reaproveitados");
+    }
+
+    return [...reused, ...uploaded];
+  }
+
   async function processMessage(message, trigger) {
     if (!message?.uid) return;
 
@@ -104,11 +193,7 @@ export function createImapWorker() {
       attachments: parsed.attachments ?? [],
     });
     const detectionMethod = trigger === "exists" ? "idle" : "resync";
-    const persistedAttachments = await uploadAttachments({
-      mailbox: env.IMAP_MAILBOX,
-      uid,
-      attachments,
-    });
+    const persistedAttachments = await resolvePersistedAttachments(uid, attachments);
     const emailRecord = {
       messageId,
       uid,
@@ -139,7 +224,7 @@ export function createImapWorker() {
     }
 
     processedUids.add(uid);
-    const minimumUidToKeep = Math.max(lastUid - recentWindowSize + 1, 1);
+    const minimumUidToKeep = Math.max(lastUid - 200 + 1, 1);
     processedUids = new Set(
       Array.from(processedUids).filter((processedUid) => processedUid >= minimumUidToKeep),
     );
@@ -169,11 +254,22 @@ export function createImapWorker() {
   async function processRange(trigger) {
     if (!client) return;
     let processed = 0;
+    const { latestPersistedUid } = await resolveSyncCursor();
     const status = await client.status(env.IMAP_MAILBOX, { uidNext: true });
     const highestUid = Math.max((status.uidNext ?? 1) - 1, 0);
-    const startUid = Math.max(highestUid - recentWindowSize + 1, 1);
 
     if (highestUid === 0) {
+      return;
+    }
+
+    const startUid = latestPersistedUid > 0 ? latestPersistedUid + 1 : 1;
+
+    if (startUid > highestUid) {
+      log.info({
+        trigger,
+        latestPersistedUid,
+        highestUid,
+      }, "Nenhum novo email encontrado para sincronização");
       return;
     }
 
@@ -188,6 +284,13 @@ export function createImapWorker() {
     }
 
     if (processed > 0) {
+      log.info({
+        trigger,
+        startUid,
+        highestUid,
+        processed,
+        latestPersistedUid,
+      }, "Sincronização de emails concluída");
     }
   }
 

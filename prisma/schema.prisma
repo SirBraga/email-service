@@ -22,6 +22,11 @@ model EmailMessage {
   html             String?
   textPreview      String?
   hasAttachments   Boolean           @default(false)
+  isRead           Boolean           @default(false)
+  readAt           DateTime?
+  readByUserId     String?
+  readByUserName   String?
+  readByUserEmail  String?
   trigger          String?
   detectionMethod  String?
   receivedAt       DateTime?
@@ -29,10 +34,12 @@ model EmailMessage {
   createdAt        DateTime          @default(now())
   updatedAt        DateTime          @updatedAt
   attachments      EmailAttachment[]
+  viewEvents       EmailViewEvent[]
 
   @@unique([mailbox, uid])
   @@index([messageId])
   @@index([receivedAt])
+  @@index([isRead])
 }
 
 model EmailAttachment {
@@ -57,4 +64,17 @@ model EmailAttachment {
 
   @@index([emailId])
   @@index([storageBucket, storageKey])
+}
+
+model EmailViewEvent {
+  id          String       @id @default(cuid())
+  emailId     String
+  viewerId    String?
+  viewerName  String?
+  viewerEmail String?
+  viewedAt    DateTime     @default(now())
+  email       EmailMessage @relation(fields: [emailId], references: [id], onDelete: Cascade)
+
+  @@index([emailId])
+  @@index([viewedAt])
 }
