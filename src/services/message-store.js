@@ -1,17 +1,47 @@
-import { mkdir, appendFile, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 const dataDir = path.resolve(process.cwd(), "data");
-const inboxFile = path.join(dataDir, "inbox.ndjson");
 const stateFile = path.join(dataDir, "state.json");
 
 async function ensureDataDir() {
   await mkdir(dataDir, { recursive: true });
 }
 
-export async function appendMessage(message) {
-  await ensureDataDir();
-  await appendFile(inboxFile, `${JSON.stringify(message)}\n`, "utf8");
+function sanitizeFilename(value, fallback) {
+  const normalized = String(value ?? "")
+    .normalize("NFKD")
+    .replace(/[^\w.-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+
+  return normalized || fallback;
+}
+
+export function prepareAttachments({ uid, attachments }) {
+  if (!Array.isArray(attachments) || attachments.length === 0) {
+    return [];
+  }
+
+  const prepared = [];
+
+  for (const [index, attachment] of attachments.entries()) {
+    const safeFilename = sanitizeFilename(attachment.filename, `attachment-${index + 1}`);
+    const storedFilename = `${String(index + 1).padStart(3, "0")}-${safeFilename}`;
+
+    prepared.push({
+      filename: attachment.filename ?? storedFilename,
+      storedFilename,
+      contentType: attachment.contentType ?? "application/octet-stream",
+      size: attachment.size ?? attachment.content?.length ?? 0,
+      contentDisposition: attachment.contentDisposition ?? null,
+      contentId: attachment.cid ?? null,
+      checksum: attachment.checksum ?? null,
+      content: attachment.content,
+    });
+  }
+
+  return prepared;
 }
 
 export async function readState() {

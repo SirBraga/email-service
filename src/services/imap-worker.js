@@ -2,7 +2,10 @@ import { ImapFlow } from "imapflow";
 import { simpleParser } from "mailparser";
 import { env } from "../config/env.js";
 import { logger } from "../shared/logger.js";
-import { appendMessage, readState, writeState } from "./message-store.js";
+import { prepareAttachments, readState, writeState } from "./message-store.js";
+import { persistEmail } from "./email-repository.js";
+import { uploadAttachments } from "./storage-service.js";
+import { dispatchEmailWebhook, isWebhookEnabled } from "./webhook-dispatcher.js";
 
 export function createImapWorker() {
   let client = null;
@@ -77,6 +80,13 @@ export function createImapWorker() {
     await client.connect();
     mailboxLock = await client.getMailboxLock(env.IMAP_MAILBOX);
     reconnectAttempts = 0;
+
+    log.info({
+      host: env.IMAP_HOST,
+      port: env.IMAP_PORT,
+      mailbox: env.IMAP_MAILBOX,
+      secure: env.IMAP_SECURE,
+    }, "Worker IMAP conectado");
   }
 
   async function processMessage(message, trigger) {
@@ -89,17 +99,40 @@ export function createImapWorker() {
 
     const parsed = await simpleParser(message.source);
     const messageId = parsed.messageId ?? `uid-${uid}`;
-
-    await appendMessage({
+    const attachments = prepareAttachments({
+      uid,
+      attachments: parsed.attachments ?? [],
+    });
+    const detectionMethod = trigger === "exists" ? "idle" : "resync";
+    const persistedAttachments = await uploadAttachments({
+      mailbox: env.IMAP_MAILBOX,
+      uid,
+      attachments,
+    });
+    const emailRecord = {
       messageId,
       uid,
       subject: parsed.subject ?? "",
       from: (parsed.from?.value ?? []).map((item) => item.address || item.name || "").filter(Boolean),
       to: (parsed.to?.value ?? []).map((item) => item.address || item.name || "").filter(Boolean),
+      cc: (parsed.cc?.value ?? []).map((item) => item.address || item.name || "").filter(Boolean),
+      bcc: (parsed.bcc?.value ?? []).map((item) => item.address || item.name || "").filter(Boolean),
+      replyTo: (parsed.replyTo?.value ?? []).map((item) => item.address || item.name || "").filter(Boolean),
       date: parsed.date?.toISOString() ?? null,
       text: parsed.text ?? null,
       html: typeof parsed.html === "string" ? parsed.html : null,
-    });
+      textPreview: (parsed.text ?? "").trim().slice(0, 500) || null,
+      hasAttachments: persistedAttachments.length > 0,
+      attachments: persistedAttachments,
+      metadata: {
+        mailbox: env.IMAP_MAILBOX,
+        trigger,
+        detectionMethod,
+        receivedAt: new Date().toISOString(),
+      },
+    };
+
+    await persistEmail(emailRecord);
 
     if (uid > lastUid) {
       lastUid = uid;
@@ -112,9 +145,25 @@ export function createImapWorker() {
     );
     await persistState();
 
-    const detectionMethod = trigger === "exists" ? "idle" : "resync";
+    if (isWebhookEnabled()) {
+      try {
+        await dispatchEmailWebhook({
+          event: "email.received",
+          version: 1,
+          email: emailRecord,
+        });
+      } catch (error) {
+        log.error({ error, uid, messageId }, "Falha ao enviar webhook do email");
+      }
+    }
 
-    log.info({ uid, messageId, subject: parsed.subject ?? "", trigger, detectionMethod }, "Email processado");
+    log.info({
+      uid,
+      messageId,
+      subject: parsed.subject ?? "",
+      from: emailRecord.from,
+      attachments: persistedAttachments.length,
+    }, "Email processado");
   }
 
   async function processRange(trigger) {

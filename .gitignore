@@ -1,2 +1,4 @@
 node_modules
 .env
+data/state.json
+prisma/dev.db

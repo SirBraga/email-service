@@ -1,0 +1,61 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model EmailMessage {
+  id               String            @id @default(cuid())
+  messageId        String?
+  mailbox          String
+  uid              Int
+  subject          String            @default("")
+  fromAddresses    Json
+  toAddresses      Json
+  ccAddresses      Json
+  bccAddresses     Json
+  replyToAddresses Json
+  sentAt           DateTime?
+  text             String?
+  html             String?
+  textPreview      String?
+  hasAttachments   Boolean           @default(false)
+  trigger          String?
+  detectionMethod  String?
+  receivedAt       DateTime?
+  rawPayload       Json
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+  attachments      EmailAttachment[]
+
+  @@unique([mailbox, uid])
+  @@index([messageId])
+  @@index([receivedAt])
+}
+
+model EmailAttachment {
+  id                 String       @id @default(cuid())
+  emailId            String
+  filename           String
+  storedFilename     String
+  contentType        String
+  size               Int
+  contentDisposition String?
+  contentId          String?
+  checksum           String?
+  localRelativePath  String?
+  localAbsolutePath  String?
+  storageProvider    String?
+  storageBucket      String?
+  storageKey         String?
+  storageUrl         String?
+  storageEtag        String?
+  createdAt          DateTime     @default(now())
+  email              EmailMessage @relation(fields: [emailId], references: [id], onDelete: Cascade)
+
+  @@index([emailId])
+  @@index([storageBucket, storageKey])
+}
