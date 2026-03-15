@@ -3,6 +3,7 @@ import { env } from "../config/env.js";
 import { logger } from "../shared/logger.js";
 import { getPrismaClient } from "../shared/prisma.js";
 import { sendEmail } from "./smtp.js";
+import { readAttachmentContent, removeStoredAttachments } from "./storage-service.js";
 
 const log = logger.child({ scope: "http-server" });
 
@@ -94,6 +95,16 @@ async function handleRequest(req, res) {
     if (path.match(/^\/api\/emails\/[^/]+\/unread$/) && method === "POST") {
       const id = path.replace("/api/emails/", "").replace("/unread", "");
       return await handleMarkEmailUnread(req, res, id);
+    }
+
+    if (path.match(/^\/api\/emails\/[^/]+$/) && method === "DELETE") {
+      const id = path.replace("/api/emails/", "");
+      return await handleDeleteEmail(req, res, id);
+    }
+
+    if (path.match(/^\/api\/attachments\/[^/]+\/download$/) && method === "GET") {
+      const id = path.replace("/api/attachments/", "").replace("/download", "");
+      return await handleDownloadAttachment(req, res, id);
     }
 
     if (path === "/api/emails/send" && method === "POST") {
@@ -341,6 +352,58 @@ async function handleMarkEmailUnread(req, res, id) {
       readByUserEmail: null,
     },
   });
+}
+
+async function handleDeleteEmail(req, res, id) {
+  const prisma = getPrismaClient();
+  if (!prisma) {
+    return sendJson(res, 503, { error: "Database not available" });
+  }
+
+  const email = await prisma.emailMessage.findUnique({
+    where: { id },
+    include: {
+      attachments: true,
+    },
+  });
+
+  if (!email) {
+    return sendJson(res, 404, { error: "Email not found" });
+  }
+
+  await removeStoredAttachments(email.attachments);
+
+  await prisma.emailMessage.delete({
+    where: { id },
+  });
+
+  sendJson(res, 200, { success: true });
+}
+
+async function handleDownloadAttachment(req, res, id) {
+  const prisma = getPrismaClient();
+  if (!prisma) {
+    return sendJson(res, 503, { error: "Database not available" });
+  }
+
+  const attachment = await prisma.emailAttachment.findUnique({
+    where: { id },
+  });
+
+  if (!attachment) {
+    return sendJson(res, 404, { error: "Attachment not found" });
+  }
+
+  const { body, contentType, filename } = await readAttachmentContent(attachment);
+  const safeFilename = filename.replace(/"/g, "");
+  const encodedFilename = encodeURIComponent(filename);
+
+  res.writeHead(200, {
+    "Content-Type": contentType,
+    "Content-Length": body.length,
+    "Content-Disposition": `attachment; filename="${safeFilename}"; filename*=UTF-8''${encodedFilename}`,
+  });
+  res.end(body);
 }
 
 async function handleSendEmail(req, res) {

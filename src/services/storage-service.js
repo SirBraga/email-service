@@ -1,4 +1,5 @@
-import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { readFile, rm } from "node:fs/promises";
 import { env, isStorageEnabled } from "../config/env.js";
 import { logger } from "../shared/logger.js";
 
@@ -137,4 +138,79 @@ export async function uploadAttachments({ mailbox, uid, attachments }) {
   }
 
   return uploaded;
+}
+
+export async function readAttachmentContent(attachment) {
+  if (attachment?.localAbsolutePath) {
+    const body = await readFile(attachment.localAbsolutePath);
+    return {
+      body,
+      contentType: attachment.contentType || "application/octet-stream",
+      filename: attachment.filename || attachment.storedFilename || "anexo",
+    };
+  }
+
+  if (attachment?.storageProvider === "s3" && attachment?.storageKey) {
+    const client = getS3Client();
+    if (!client) {
+      throw new Error("Storage não está configurado para download do anexo");
+    }
+
+    const response = await client.send(
+      new GetObjectCommand({
+        Bucket: attachment.storageBucket || env.EMAIL_STORAGE_BUCKET,
+        Key: attachment.storageKey,
+      }),
+    );
+
+    const body = Buffer.from(await response.Body.transformToByteArray());
+
+    return {
+      body,
+      contentType: response.ContentType || attachment.contentType || "application/octet-stream",
+      filename: attachment.filename || attachment.storedFilename || "anexo",
+    };
+  }
+
+  throw new Error("Anexo não possui origem de armazenamento válida");
+}
+
+export async function removeStoredAttachment(attachment) {
+  if (attachment?.localAbsolutePath) {
+    await rm(attachment.localAbsolutePath, { force: true });
+    return;
+  }
+
+  if (attachment?.storageProvider === "s3" && attachment?.storageKey) {
+    const client = getS3Client();
+    if (!client) {
+      throw new Error("Storage não está configurado para remoção do anexo");
+    }
+
+    await client.send(
+      new DeleteObjectCommand({
+        Bucket: attachment.storageBucket || env.EMAIL_STORAGE_BUCKET,
+        Key: attachment.storageKey,
+      }),
+    );
+  }
+}
+
+export async function removeStoredAttachments(attachments) {
+  for (const attachment of attachments || []) {
+    try {
+      await removeStoredAttachment(attachment);
+    } catch (error) {
+      logger.warn(
+        {
+          attachmentId: attachment?.id ?? null,
+          filename: attachment?.filename ?? null,
+          storageKey: attachment?.storageKey ?? null,
+          localAbsolutePath: attachment?.localAbsolutePath ?? null,
+          error: error?.message ?? "Erro desconhecido",
+        },
+        "Falha ao remover anexo armazenado; seguindo com a exclusão do email",
+      );
+    }
+  }
 }
