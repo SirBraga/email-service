@@ -4,14 +4,17 @@ import { logger } from "../shared/logger.js";
 import { getPrismaClient } from "../shared/prisma.js";
 import {
   blockSender,
+  getNextMailboxUid,
   listBlockedSenders,
   listDeletedEmails,
+  persistEmail,
   registerDeletedEmail,
   restoreDeletedEmail,
   unblockSender,
 } from "./email-repository.js";
+import { prepareAttachments } from "./message-store.js";
 import { sendEmail } from "./smtp.js";
-import { readAttachmentContent, removeStoredAttachments } from "./storage-service.js";
+import { readAttachmentContent, removeStoredAttachments, uploadAttachments } from "./storage-service.js";
 
 const log = logger.child({ scope: "http-server" });
 
@@ -72,6 +75,68 @@ function classifyMailbox(mailbox) {
   if (env.IMAP_SENT_MAILBOXES.includes(mailbox)) return "sent";
   if (env.IMAP_SPAM_MAILBOXES.includes(mailbox)) return "spam";
   return "inbox";
+}
+
+function normalizeSenderEmail(value) {
+  if (typeof value !== "string") {
+    return "";
+  }
+
+  const trimmed = value.trim().toLowerCase();
+  const bracketMatch = trimmed.match(/<([^>]+)>/);
+  if (bracketMatch?.[1]) {
+    return bracketMatch[1].trim();
+  }
+
+  const emailMatch = trimmed.match(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/);
+  return emailMatch?.[0] ?? trimmed;
+}
+
+function parseBooleanQuery(value) {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (["true", "1", "yes", "sim"].includes(normalized)) {
+    return true;
+  }
+
+  if (["false", "0", "no", "nao", "não"].includes(normalized)) {
+    return false;
+  }
+
+  return null;
+}
+
+function resolveEmailFilters(query) {
+  const filter = typeof query.filter === "string" ? query.filter.trim().toLowerCase() : "";
+  const read = typeof query.read === "string" ? query.read.trim().toLowerCase() : "";
+  const isRead = parseBooleanQuery(query.isRead);
+  const hasAttachments = parseBooleanQuery(query.hasAttachments);
+  const blocked = parseBooleanQuery(query.blocked);
+
+  const filters = {
+    isRead: isRead,
+    hasAttachments,
+    blocked,
+  };
+
+  if (filter === "unread" || read === "unread") {
+    filters.isRead = false;
+  } else if (filter === "read" || read === "read") {
+    filters.isRead = true;
+  }
+
+  if (filter === "attachments") {
+    filters.hasAttachments = true;
+  }
+
+  if (filter === "blocked") {
+    filters.blocked = true;
+  }
+
+  return filters;
 }
 
 function mapBlockedSender(item) {
@@ -209,6 +274,8 @@ async function handleListEmails(req, res) {
   const search = query.search || "";
   const mailbox = query.mailbox || "";
   const mailboxType = query.mailboxType || "";
+  const filters = resolveEmailFilters(query);
+  const isSentWindow = mailboxType === "sent" && !mailbox;
 
   const where = {};
 
@@ -234,12 +301,55 @@ async function handleListEmails(req, res) {
     };
   }
 
-  const [emails, total] = await Promise.all([
-    prisma.emailMessage.findMany({
+  if (typeof filters.isRead === "boolean") {
+    where.isRead = filters.isRead;
+  }
+
+  if (typeof filters.hasAttachments === "boolean") {
+    where.hasAttachments = filters.hasAttachments;
+  }
+
+  let sentWindowIds = null;
+  let blockedSenderMap = new Map();
+
+  if (isSentWindow) {
+    const sentWindow = await prisma.emailMessage.findMany({
       where,
       orderBy: { receivedAt: "desc" },
-      skip,
-      take: limit,
+      take: 50,
+      select: { id: true },
+    });
+    sentWindowIds = sentWindow.map((email) => email.id);
+  }
+
+  if (filters.blocked !== false) {
+    const blockedSenders = await prisma.emailBlockedSender.findMany({
+      select: {
+        id: true,
+        email: true,
+        normalizedEmail: true,
+      },
+    });
+    blockedSenderMap = new Map(blockedSenders.map((sender) => [sender.normalizedEmail, sender]));
+  }
+
+  const effectiveWhere = sentWindowIds
+    ? {
+        ...where,
+        id: {
+          in: sentWindowIds.length > 0 ? sentWindowIds : ["__no-sent-emails__"],
+        },
+      }
+    : where;
+
+  const shouldFilterByBlocked = typeof filters.blocked === "boolean";
+  const fetchLimit = shouldFilterByBlocked ? Math.max(limit * 5, limit) : limit;
+  const [emails, total] = await Promise.all([
+    prisma.emailMessage.findMany({
+      where: effectiveWhere,
+      orderBy: { receivedAt: "desc" },
+      skip: shouldFilterByBlocked ? 0 : skip,
+      take: shouldFilterByBlocked ? Math.max(skip + fetchLimit, fetchLimit) : limit,
       include: {
         attachments: {
           select: {
@@ -252,10 +362,28 @@ async function handleListEmails(req, res) {
         },
       },
     }),
-    prisma.emailMessage.count({ where }),
+    prisma.emailMessage.count({ where: effectiveWhere }),
   ]);
 
-  const formatted = emails.map((email) => ({
+  const decoratedEmails = emails.map((email) => {
+    const fromAddress = Array.isArray(email.fromAddresses) ? email.fromAddresses[0] : null;
+    const normalizedSender = normalizeSenderEmail(fromAddress);
+    const blockedSender = normalizedSender ? blockedSenderMap.get(normalizedSender) ?? null : null;
+
+    return {
+      ...email,
+      blockedSender,
+      isBlocked: Boolean(blockedSender),
+    };
+  });
+
+  const filteredEmails = shouldFilterByBlocked
+    ? decoratedEmails.filter((email) => email.isBlocked === filters.blocked)
+    : decoratedEmails;
+  const paginatedEmails = shouldFilterByBlocked ? filteredEmails.slice(skip, skip + limit) : filteredEmails;
+  const effectiveTotal = shouldFilterByBlocked ? filteredEmails.length : total;
+
+  const formatted = paginatedEmails.map((email) => ({
     id: email.id,
     messageId: email.messageId,
     uid: email.uid,
@@ -269,6 +397,9 @@ async function handleListEmails(req, res) {
     receivedAt: getReceivedAt(email),
     hasAttachments: email.hasAttachments,
     isRead: email.isRead,
+    isBlocked: email.isBlocked,
+    blockedSenderId: email.blockedSender?.id ?? null,
+    blockedSenderEmail: email.blockedSender?.email ?? null,
     readAt: email.readAt ? email.readAt.toISOString() : null,
     readByUserName: email.readByUserName,
     attachmentCount: email.attachments.length,
@@ -280,8 +411,8 @@ async function handleListEmails(req, res) {
     pagination: {
       page,
       limit,
-      total,
-      totalPages: Math.ceil(total / limit),
+      total: effectiveTotal,
+      totalPages: Math.ceil(effectiveTotal / limit),
     },
   });
 }
@@ -308,6 +439,16 @@ async function handleGetEmail(req, res, id) {
     return sendJson(res, 404, { error: "Email not found" });
   }
 
+  const fromAddress = Array.isArray(email.fromAddresses) ? email.fromAddresses[0] : null;
+  const normalizedSender = normalizeSenderEmail(fromAddress);
+  const blockedSender = normalizedSender
+    ? await prisma.emailBlockedSender.findUnique({
+        where: {
+          normalizedEmail: normalizedSender,
+        },
+      })
+    : null;
+
   sendJson(res, 200, {
     id: email.id,
     messageId: email.messageId,
@@ -326,6 +467,9 @@ async function handleGetEmail(req, res, id) {
     htmlBody: email.html,
     hasAttachments: email.hasAttachments,
     isRead: email.isRead,
+    isBlocked: Boolean(blockedSender),
+    blockedSenderId: blockedSender?.id ?? null,
+    blockedSenderEmail: blockedSender?.email ?? null,
     readAt: email.readAt ? email.readAt.toISOString() : null,
     readByUserId: email.readByUserId,
     readByUserName: email.readByUserName,
@@ -545,6 +689,10 @@ async function handleSendEmail(req, res) {
   }
 
   try {
+    const sentMailbox = env.IMAP_SENT_MAILBOXES[0] || "Sent";
+    const sentUid = await getNextMailboxUid(sentMailbox);
+    const attachmentInputs = Array.isArray(attachments) ? attachments : [];
+
     const result = await sendEmail({
       to: Array.isArray(to) ? to : [to],
       subject,
@@ -553,14 +701,52 @@ async function handleSendEmail(req, res) {
       cc: cc ? (Array.isArray(cc) ? cc : [cc]) : [],
       bcc: bcc ? (Array.isArray(bcc) ? bcc : [bcc]) : [],
       replyTo: replyTo || undefined,
-      attachments: Array.isArray(attachments)
-        ? attachments.map((attachment) => ({
+      attachments: attachmentInputs.map((attachment) => ({
             filename: attachment.filename,
             contentType: attachment.contentType || "application/octet-stream",
             content: attachment.contentBase64,
             encoding: "base64",
-          }))
-        : [],
+          })),
+    });
+
+    const preparedAttachments = prepareAttachments({
+      uid: sentUid,
+      attachments: attachmentInputs.map((attachment) => ({
+        filename: attachment.filename,
+        contentType: attachment.contentType || "application/octet-stream",
+        size: attachment.size,
+        content: Buffer.from(attachment.contentBase64, "base64"),
+      })),
+    });
+
+    const storedAttachments = await uploadAttachments({
+      mailbox: sentMailbox,
+      uid: sentUid,
+      attachments: preparedAttachments,
+    });
+
+    await persistEmail({
+      messageId: result.messageId,
+      uid: sentUid,
+      subject,
+      from: [env.MAIL_FROM].filter(Boolean),
+      to: Array.isArray(to) ? to : [to],
+      cc: cc ? (Array.isArray(cc) ? cc : [cc]) : [],
+      bcc: bcc ? (Array.isArray(bcc) ? bcc : [bcc]) : [],
+      replyTo: replyTo ? (Array.isArray(replyTo) ? replyTo : [replyTo]) : [],
+      date: new Date().toISOString(),
+      text: text || "",
+      html: html || "",
+      textPreview: (text || "").trim().slice(0, 500) || null,
+      hasAttachments: storedAttachments.length > 0,
+      attachments: storedAttachments,
+      metadata: {
+        mailbox: sentMailbox,
+        mailboxType: "sent",
+        trigger: "system-send",
+        detectionMethod: "manual_send",
+        receivedAt: new Date().toISOString(),
+      },
     });
 
     sendJson(res, 200, {
@@ -580,7 +766,9 @@ async function handleGetStats(req, res) {
   }
 
   const inboxMailboxes = env.IMAP_MAILBOXES.length > 0 ? env.IMAP_MAILBOXES : [env.IMAP_MAILBOX];
-  const [totalEmails, totalAttachments, todayEmails, unreadEmails] = await Promise.all([
+  const sentMailboxes = env.IMAP_SENT_MAILBOXES;
+  const spamMailboxes = env.IMAP_SPAM_MAILBOXES;
+  const [totalEmails, totalAttachments, todayEmails, unreadEmails, inboxEmails, sentEmails, spamEmails] = await Promise.all([
     prisma.emailMessage.count(),
     prisma.emailAttachment.count(),
     prisma.emailMessage.count({
@@ -598,6 +786,27 @@ async function handleGetStats(req, res) {
         },
       },
     }),
+    prisma.emailMessage.count({
+      where: {
+        mailbox: {
+          in: inboxMailboxes,
+        },
+      },
+    }),
+    prisma.emailMessage.count({
+      where: {
+        mailbox: {
+          in: sentMailboxes.length > 0 ? sentMailboxes : ["__no-sent-emails__"],
+        },
+      },
+    }),
+    prisma.emailMessage.count({
+      where: {
+        mailbox: {
+          in: spamMailboxes.length > 0 ? spamMailboxes : ["__no-spam-emails__"],
+        },
+      },
+    }),
   ]);
 
   sendJson(res, 200, {
@@ -605,6 +814,9 @@ async function handleGetStats(req, res) {
     totalAttachments,
     todayEmails,
     unreadEmails,
+    inboxEmails,
+    sentEmails,
+    spamEmails,
   });
 }
 

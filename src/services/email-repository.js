@@ -11,7 +11,18 @@ function toDateOrNull(value) {
 }
 
 function normalizeSenderEmail(value) {
-  return typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (typeof value !== "string") {
+    return "";
+  }
+
+  const trimmed = value.trim().toLowerCase();
+  const bracketMatch = trimmed.match(/<([^>]+)>/);
+  if (bracketMatch?.[1]) {
+    return bracketMatch[1].trim();
+  }
+
+  const emailMatch = trimmed.match(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/);
+  return emailMatch?.[0] ?? trimmed;
 }
 
 export async function persistEmail(emailRecord) {
@@ -156,6 +167,66 @@ export async function findLatestPersistedEmail(mailbox) {
   });
 }
 
+export async function getNextMailboxUid(mailbox) {
+  if (!isDatabaseEnabled()) {
+    return 1;
+  }
+
+  const prisma = getPrismaClient();
+  if (!prisma) {
+    return 1;
+  }
+
+  const latest = await prisma.emailMessage.findFirst({
+    where: { mailbox },
+    orderBy: { uid: "desc" },
+    select: { uid: true },
+  });
+
+  return Math.max(Number(latest?.uid ?? 0) + 1, 1);
+}
+
+export async function pruneMailboxToLatest(mailbox, keepCount) {
+  if (!isDatabaseEnabled()) {
+    return { deletedCount: 0, keptCount: 0, latestUid: 0 };
+  }
+
+  const prisma = getPrismaClient();
+  if (!prisma) {
+    return { deletedCount: 0, keptCount: 0, latestUid: 0 };
+  }
+
+  const normalizedKeepCount = Math.max(0, Number(keepCount) || 0);
+  const emails = await prisma.emailMessage.findMany({
+    where: { mailbox },
+    orderBy: { uid: "desc" },
+    select: { id: true, uid: true },
+  });
+
+  if (emails.length === 0) {
+    return { deletedCount: 0, keptCount: 0, latestUid: 0 };
+  }
+
+  const kept = emails.slice(0, normalizedKeepCount);
+  const toDelete = emails.slice(normalizedKeepCount);
+
+  if (toDelete.length > 0) {
+    await prisma.emailMessage.deleteMany({
+      where: {
+        id: {
+          in: toDelete.map((email) => email.id),
+        },
+      },
+    });
+  }
+
+  return {
+    deletedCount: toDelete.length,
+    keptCount: kept.length,
+    latestUid: kept[0]?.uid ?? 0,
+  };
+}
+
 export async function registerDeletedEmail(email, deletedBy = {}) {
   if (!isDatabaseEnabled()) {
     return null;
@@ -167,36 +238,59 @@ export async function registerDeletedEmail(email, deletedBy = {}) {
   }
 
   const fromAddress = Array.isArray(email.fromAddresses) ? email.fromAddresses[0] : null;
+  const baseCreate = {
+    mailbox: email.mailbox,
+    uid: email.uid,
+    messageId: email.messageId ?? null,
+    subject: email.subject ?? null,
+    fromAddress: typeof fromAddress === "string" ? fromAddress : null,
+    deletedByUserId: deletedBy.viewerId ?? null,
+    deletedByUserName: deletedBy.viewerName ?? null,
+    deletedByUserEmail: deletedBy.viewerEmail ?? null,
+  };
+  const baseUpdate = {
+    messageId: email.messageId ?? null,
+    subject: email.subject ?? null,
+    fromAddress: typeof fromAddress === "string" ? fromAddress : null,
+    deletedByUserId: deletedBy.viewerId ?? null,
+    deletedByUserName: deletedBy.viewerName ?? null,
+    deletedByUserEmail: deletedBy.viewerEmail ?? null,
+    deletedAt: new Date(),
+  };
 
-  return prisma.emailDeletedMessage.upsert({
-    where: {
-      mailbox_uid: {
-        mailbox: email.mailbox,
-        uid: email.uid,
+  try {
+    return await prisma.emailDeletedMessage.upsert({
+      where: {
+        mailbox_uid: {
+          mailbox: email.mailbox,
+          uid: email.uid,
+        },
       },
-    },
-    create: {
-      mailbox: email.mailbox,
-      uid: email.uid,
-      messageId: email.messageId ?? null,
-      subject: email.subject ?? null,
-      fromAddress: typeof fromAddress === "string" ? fromAddress : null,
-      rawPayload: email.rawPayload,
-      deletedByUserId: deletedBy.viewerId ?? null,
-      deletedByUserName: deletedBy.viewerName ?? null,
-      deletedByUserEmail: deletedBy.viewerEmail ?? null,
-    },
-    update: {
-      messageId: email.messageId ?? null,
-      subject: email.subject ?? null,
-      fromAddress: typeof fromAddress === "string" ? fromAddress : null,
-      rawPayload: email.rawPayload,
-      deletedByUserId: deletedBy.viewerId ?? null,
-      deletedByUserName: deletedBy.viewerName ?? null,
-      deletedByUserEmail: deletedBy.viewerEmail ?? null,
-      deletedAt: new Date(),
-    },
-  });
+      create: {
+        ...baseCreate,
+        rawPayload: email.rawPayload,
+      },
+      update: {
+        ...baseUpdate,
+        rawPayload: email.rawPayload,
+      },
+    });
+  } catch (error) {
+    if (!String(error?.message ?? "").includes("Unknown argument `rawPayload`")) {
+      throw error;
+    }
+
+    return prisma.emailDeletedMessage.upsert({
+      where: {
+        mailbox_uid: {
+          mailbox: email.mailbox,
+          uid: email.uid,
+        },
+      },
+      create: baseCreate,
+      update: baseUpdate,
+    });
+  }
 }
 
 export async function findDeletedEmail(mailbox, uid) {
@@ -252,6 +346,10 @@ export async function restoreDeletedEmail(id) {
 
   if (!deleted) {
     throw new Error("Email excluído não encontrado");
+  }
+
+  if (!deleted.rawPayload) {
+    throw new Error("Email excluído sem payload para restauração");
   }
 
   await persistEmail(deleted.rawPayload);

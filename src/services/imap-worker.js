@@ -17,12 +17,11 @@ function normalizeEmailAddress(value) {
   return typeof value === "string" ? value.trim().toLowerCase() : "";
 }
 
-function resolveConfiguredMailboxes() {
-  const configured = new Set(env.IMAP_MAILBOXES);
-  configured.add(env.IMAP_MAILBOX);
-  for (const mailbox of env.IMAP_SENT_MAILBOXES) configured.add(mailbox);
-  for (const mailbox of env.IMAP_SPAM_MAILBOXES) configured.add(mailbox);
-  return Array.from(configured).filter(Boolean);
+function buildConfiguredMailboxMap() {
+  return {
+    inbox: new Set([...env.IMAP_MAILBOXES, env.IMAP_MAILBOX].filter(Boolean)),
+    spam: new Set(env.IMAP_SPAM_MAILBOXES.filter(Boolean)),
+  };
 }
 
 export function createImapWorker() {
@@ -37,7 +36,16 @@ export function createImapWorker() {
   let processingRangePromise = null;
 
   const log = logger.child({ scope: "imap-worker" });
-  const mailboxes = resolveConfiguredMailboxes();
+  const mailboxGroups = buildConfiguredMailboxMap();
+
+  function getAllMailboxes() {
+    return Array.from(
+      new Set([
+        ...mailboxGroups.inbox,
+        ...mailboxGroups.spam,
+      ]),
+    ).filter(Boolean);
+  }
 
   function getMailboxState(mailbox) {
     if (!mailboxStates[mailbox]) {
@@ -54,7 +62,7 @@ export function createImapWorker() {
     const state = await readState();
     mailboxStates = {};
 
-    for (const mailbox of mailboxes) {
+    for (const mailbox of getAllMailboxes()) {
       const saved = state.mailboxes?.[mailbox];
       mailboxStates[mailbox] = {
         lastUid: Number(saved?.lastUid ?? (mailbox === env.IMAP_MAILBOX ? state.lastUid : 0)) || 0,
@@ -144,9 +152,31 @@ export function createImapWorker() {
     log.info({
       host: env.IMAP_HOST,
       port: env.IMAP_PORT,
-      mailboxes,
+      mailboxes: getAllMailboxes(),
       secure: env.IMAP_SECURE,
     }, "Worker IMAP conectado");
+
+    const listedMailboxes = await client.list().catch(() => []);
+    const availableMailboxes = new Set(listedMailboxes.map((mailbox) => mailbox.path).filter(Boolean));
+    for (const mailbox of listedMailboxes) {
+      const path = mailbox.path;
+      if (!path) continue;
+
+      if (mailbox.specialUse === "\\Junk") {
+        mailboxGroups.spam.add(path);
+      }
+
+      if (mailbox.specialUse === "\\Inbox") {
+        mailboxGroups.inbox.add(path);
+      }
+    }
+
+    mailboxGroups.inbox = new Set(
+      Array.from(mailboxGroups.inbox).filter((mailbox) => availableMailboxes.has(mailbox)),
+    );
+    mailboxGroups.spam = new Set(
+      Array.from(mailboxGroups.spam).filter((mailbox) => availableMailboxes.has(mailbox)),
+    );
   }
 
   async function acquireMailbox(mailbox) {
@@ -233,8 +263,7 @@ export function createImapWorker() {
   }
 
   function classifyMailbox(mailbox) {
-    if (env.IMAP_SENT_MAILBOXES.includes(mailbox)) return "sent";
-    if (env.IMAP_SPAM_MAILBOXES.includes(mailbox)) return "spam";
+    if (mailboxGroups.spam.has(mailbox)) return "spam";
     return "inbox";
   }
 
@@ -285,6 +314,7 @@ export function createImapWorker() {
     const attachments = prepareAttachments({ uid, attachments: parsed.attachments ?? [] });
     const detectionMethod = trigger === "exists" ? "idle" : "resync";
     const persistedAttachments = await resolvePersistedAttachments(mailbox, uid, attachments);
+    const mailboxType = classifyMailbox(mailbox);
     const emailRecord = {
       messageId,
       uid,
@@ -302,7 +332,7 @@ export function createImapWorker() {
       attachments: persistedAttachments,
       metadata: {
         mailbox,
-        mailboxType: classifyMailbox(mailbox),
+        mailboxType,
         trigger,
         detectionMethod,
         receivedAt: new Date().toISOString(),
@@ -322,7 +352,7 @@ export function createImapWorker() {
     );
     await persistState();
 
-    if (isWebhookEnabled()) {
+    if (isWebhookEnabled() && mailboxType === "inbox") {
       try {
         await dispatchEmailWebhook({
           event: "email.received",
@@ -358,10 +388,16 @@ export function createImapWorker() {
       return 0;
     }
 
-    const startUid = latestPersistedUid > 0 ? latestPersistedUid + 1 : 1;
+    const mailboxType = classifyMailbox(mailbox);
+    const isInitialSpamSync = mailboxType === "spam" && latestPersistedUid === 0;
+    const startUid = latestPersistedUid > 0
+      ? latestPersistedUid + 1
+      : isInitialSpamSync
+        ? Math.max(highestUid - 20 + 1, 1)
+        : 1;
 
     if (startUid > highestUid) {
-      log.info({ mailbox, trigger, latestPersistedUid, highestUid }, "Nenhum novo email encontrado para sincronização");
+      log.info({ mailbox, trigger, latestPersistedUid, highestUid, mailboxType }, "Nenhum novo email encontrado para sincronização");
       return 0;
     }
 
@@ -372,7 +408,7 @@ export function createImapWorker() {
     }
 
     if (processed > 0) {
-      log.info({ mailbox, trigger, startUid, highestUid, processed, latestPersistedUid }, "Sincronização de emails concluída");
+      log.info({ mailbox, trigger, startUid, highestUid, processed, latestPersistedUid, mailboxType }, "Sincronização de emails concluída");
     }
 
     return processed;
@@ -381,7 +417,7 @@ export function createImapWorker() {
   async function processRange(trigger) {
     if (!client) return;
 
-    for (const mailbox of mailboxes) {
+    for (const mailbox of getAllMailboxes()) {
       await processMailboxRange(mailbox, trigger);
     }
   }
@@ -464,7 +500,7 @@ export function createImapWorker() {
   async function startIdleLoop() {
     if (!client) return;
 
-    const idleMailbox = mailboxes[0] || env.IMAP_MAILBOX;
+    const idleMailbox = getAllMailboxes()[0] || env.IMAP_MAILBOX;
     if (activeMailbox !== idleMailbox) {
       await acquireMailbox(idleMailbox);
     }

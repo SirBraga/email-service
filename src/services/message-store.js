@@ -23,6 +23,7 @@ function normalizeMailboxState(input) {
   return {
     lastUid: Number(value.lastUid ?? 0) || 0,
     processedUids: Array.isArray(value.processedUids) ? value.processedUids : [],
+    sentInitialWindowApplied: Boolean(value.sentInitialWindowApplied),
   };
 }
 

@@ -87,6 +87,7 @@ model EmailDeletedMessage {
   messageId          String?
   subject            String?
   fromAddress        String?
+  rawPayload         Json?
   deletedByUserId    String?
   deletedByUserName  String?
   deletedByUserEmail String?
