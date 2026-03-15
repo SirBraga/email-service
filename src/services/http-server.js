@@ -501,6 +501,21 @@ async function handleMarkEmailRead(req, res, id) {
   const body = await parseBody(req);
   const { viewerId, viewerName, viewerEmail } = normalizeViewer(body);
   const now = new Date();
+  const existingEmail = await prisma.emailMessage.findUnique({
+    where: { id },
+    select: {
+      id: true,
+      mailbox: true,
+    },
+  });
+
+  if (!existingEmail) {
+    return sendJson(res, 404, { error: "Email not found" });
+  }
+
+  if (classifyMailbox(existingEmail.mailbox) === "sent") {
+    return sendJson(res, 400, { error: "Emails enviados não possuem controle de leitura" });
+  }
 
   const email = await prisma.emailMessage.update({
     where: { id },
@@ -552,6 +567,22 @@ async function handleMarkEmailUnread(req, res, id) {
   const prisma = getPrismaClient();
   if (!prisma) {
     return sendJson(res, 503, { error: "Database not available" });
+  }
+
+  const existingEmail = await prisma.emailMessage.findUnique({
+    where: { id },
+    select: {
+      id: true,
+      mailbox: true,
+    },
+  });
+
+  if (!existingEmail) {
+    return sendJson(res, 404, { error: "Email not found" });
+  }
+
+  if (classifyMailbox(existingEmail.mailbox) === "sent") {
+    return sendJson(res, 400, { error: "Emails enviados não possuem controle de leitura" });
   }
 
   const email = await prisma.emailMessage.update({
@@ -682,7 +713,7 @@ async function handleUnblockSender(req, res, id) {
 async function handleSendEmail(req, res) {
   const body = await parseBody(req);
 
-  const { to, subject, text, html, cc, bcc, replyTo, attachments } = body;
+  const { to, subject, text, html, cc, bcc, replyTo, attachments, sender } = body;
 
   if (!to || !subject) {
     return sendJson(res, 400, { error: "Missing required fields: to, subject" });
@@ -692,6 +723,16 @@ async function handleSendEmail(req, res) {
     const sentMailbox = env.IMAP_SENT_MAILBOXES[0] || "Sent";
     const sentUid = await getNextMailboxUid(sentMailbox);
     const attachmentInputs = Array.isArray(attachments) ? attachments : [];
+
+    log.info({
+      subject,
+      toCount: Array.isArray(to) ? to.length : 1,
+      ccCount: Array.isArray(cc) ? cc.length : cc ? 1 : 0,
+      bccCount: Array.isArray(bcc) ? bcc.length : bcc ? 1 : 0,
+      attachmentCount: attachmentInputs.length,
+      sentMailbox,
+      sentUid,
+    }, "Iniciando envio de email");
 
     const result = await sendEmail({
       to: Array.isArray(to) ? to : [to],
@@ -708,6 +749,12 @@ async function handleSendEmail(req, res) {
             encoding: "base64",
           })),
     });
+
+    log.info({
+      messageId: result.messageId,
+      sentMailbox,
+      sentUid,
+    }, "Email enviado via SMTP");
 
     const preparedAttachments = prepareAttachments({
       uid: sentUid,
@@ -746,15 +793,33 @@ async function handleSendEmail(req, res) {
         trigger: "system-send",
         detectionMethod: "manual_send",
         receivedAt: new Date().toISOString(),
+        internalSender: {
+          userId: typeof sender?.userId === "string" ? sender.userId : null,
+          userName: typeof sender?.userName === "string" ? sender.userName : null,
+          userEmail: typeof sender?.userEmail === "string" ? sender.userEmail : null,
+        },
       },
     });
+
+    log.info({
+      messageId: result.messageId,
+      sentMailbox,
+      sentUid,
+      storedAttachments: storedAttachments.length,
+    }, "Email persistido em enviados");
 
     sendJson(res, 200, {
       success: true,
       messageId: result.messageId,
+      mailbox: sentMailbox,
+      uid: sentUid,
     });
   } catch (error) {
-    log.error({ error: error.message }, "Falha ao enviar email");
+    log.error({
+      error: error.message,
+      subject,
+      toCount: Array.isArray(to) ? to.length : to ? 1 : 0,
+    }, "Falha ao enviar email");
     sendJson(res, 500, { error: error.message || "Failed to send email" });
   }
 }
