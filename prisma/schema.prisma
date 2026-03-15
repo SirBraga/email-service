@@ -40,6 +40,7 @@ model EmailMessage {
   @@index([messageId])
   @@index([receivedAt])
   @@index([isRead])
+  @@index([mailbox])
 }
 
 model EmailAttachment {
@@ -77,4 +78,36 @@ model EmailViewEvent {
 
   @@index([emailId])
   @@index([viewedAt])
+}
+
+model EmailDeletedMessage {
+  id                 String   @id @default(cuid())
+  mailbox            String
+  uid                Int
+  messageId          String?
+  subject            String?
+  fromAddress        String?
+  deletedByUserId    String?
+  deletedByUserName  String?
+  deletedByUserEmail String?
+  deletedAt          DateTime @default(now())
+
+  @@unique([mailbox, uid])
+  @@index([messageId])
+  @@index([deletedAt])
+}
+
+model EmailBlockedSender {
+  id                 String   @id @default(cuid())
+  email              String
+  normalizedEmail    String   @unique
+  reason             String?
+  blockedByUserId    String?
+  blockedByUserName  String?
+  blockedByUserEmail String?
+  blockedAt          DateTime @default(now())
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@index([blockedAt])
 }

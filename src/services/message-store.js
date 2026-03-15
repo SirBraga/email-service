@@ -18,6 +18,14 @@ function sanitizeFilename(value, fallback) {
   return normalized || fallback;
 }
 
+function normalizeMailboxState(input) {
+  const value = input && typeof input === "object" ? input : {};
+  return {
+    lastUid: Number(value.lastUid ?? 0) || 0,
+    processedUids: Array.isArray(value.processedUids) ? value.processedUids : [],
+  };
+}
+
 export function prepareAttachments({ uid, attachments }) {
   if (!Array.isArray(attachments) || attachments.length === 0) {
     return [];
@@ -50,12 +58,16 @@ export async function readState() {
   try {
     const content = await readFile(stateFile, "utf8");
     const parsed = JSON.parse(content);
+    const mailboxes = parsed.mailboxes && typeof parsed.mailboxes === "object" ? parsed.mailboxes : {};
     return {
       lastUid: parsed.lastUid ?? 0,
       processedUids: Array.isArray(parsed.processedUids) ? parsed.processedUids : [],
+      mailboxes: Object.fromEntries(
+        Object.entries(mailboxes).map(([mailbox, mailboxState]) => [mailbox, normalizeMailboxState(mailboxState)]),
+      ),
     };
   } catch {
-    return { lastUid: 0, processedUids: [] };
+    return { lastUid: 0, processedUids: [], mailboxes: {} };
   }
 }
 

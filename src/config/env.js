@@ -22,6 +22,14 @@ function parseNumber(value, fallback) {
   return parsed;
 }
 
+function parseMailboxList(value, fallback) {
+  const source = value ?? fallback;
+  return String(source)
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
 export const env = {
   NODE_ENV: process.env.NODE_ENV ?? "development",
   LOG_LEVEL: process.env.LOG_LEVEL ?? "info",
@@ -33,6 +41,9 @@ export const env = {
   IMAP_USER: requireEnv("IMAP_USER"),
   IMAP_PASS: requireEnv("IMAP_PASS"),
   IMAP_MAILBOX: process.env.IMAP_MAILBOX ?? "INBOX",
+  IMAP_MAILBOXES: parseMailboxList(process.env.IMAP_MAILBOXES, process.env.IMAP_MAILBOX ?? "INBOX"),
+  IMAP_SENT_MAILBOXES: parseMailboxList(process.env.IMAP_SENT_MAILBOXES, "Sent,Sent Items,[Gmail]/Sent Mail"),
+  IMAP_SPAM_MAILBOXES: parseMailboxList(process.env.IMAP_SPAM_MAILBOXES, "Spam,Junk,Junk Email,[Gmail]/Spam"),
   IMAP_MAX_IDLE_TIME_MS: parseNumber(process.env.IMAP_MAX_IDLE_TIME_MS, 240000),
   IMAP_RESYNC_INTERVAL_MS: parseNumber(process.env.IMAP_RESYNC_INTERVAL_MS, 600000),
   IMAP_RECONNECT_INITIAL_DELAY_MS: parseNumber(process.env.IMAP_RECONNECT_INITIAL_DELAY_MS, 2000),

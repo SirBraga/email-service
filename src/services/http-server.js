@@ -2,6 +2,14 @@ import { createServer } from "node:http";
 import { env } from "../config/env.js";
 import { logger } from "../shared/logger.js";
 import { getPrismaClient } from "../shared/prisma.js";
+import {
+  blockSender,
+  listBlockedSenders,
+  listDeletedEmails,
+  registerDeletedEmail,
+  restoreDeletedEmail,
+  unblockSender,
+} from "./email-repository.js";
 import { sendEmail } from "./smtp.js";
 import { readAttachmentContent, removeStoredAttachments } from "./storage-service.js";
 
@@ -15,7 +23,7 @@ function parseBody(req) {
       try {
         const body = Buffer.concat(chunks).toString();
         resolve(body ? JSON.parse(body) : {});
-      } catch (error) {
+      } catch {
         reject(new Error("Invalid JSON body"));
       }
     });
@@ -58,6 +66,42 @@ function cors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+}
+
+function classifyMailbox(mailbox) {
+  if (env.IMAP_SENT_MAILBOXES.includes(mailbox)) return "sent";
+  if (env.IMAP_SPAM_MAILBOXES.includes(mailbox)) return "spam";
+  return "inbox";
+}
+
+function mapBlockedSender(item) {
+  return {
+    id: item.id,
+    email: item.email,
+    normalizedEmail: item.normalizedEmail,
+    reason: item.reason,
+    blockedByUserId: item.blockedByUserId,
+    blockedByUserName: item.blockedByUserName,
+    blockedByUserEmail: item.blockedByUserEmail,
+    blockedAt: item.blockedAt ? item.blockedAt.toISOString() : null,
+    createdAt: item.createdAt ? item.createdAt.toISOString() : null,
+    updatedAt: item.updatedAt ? item.updatedAt.toISOString() : null,
+  };
+}
+
+function mapDeletedEmail(item) {
+  return {
+    id: item.id,
+    mailbox: item.mailbox,
+    uid: item.uid,
+    messageId: item.messageId,
+    subject: item.subject,
+    fromAddress: item.fromAddress,
+    deletedByUserId: item.deletedByUserId,
+    deletedByUserName: item.deletedByUserName,
+    deletedByUserEmail: item.deletedByUserEmail,
+    deletedAt: item.deletedAt ? item.deletedAt.toISOString() : null,
+  };
 }
 
 async function handleRequest(req, res) {
@@ -107,6 +151,28 @@ async function handleRequest(req, res) {
       return await handleDownloadAttachment(req, res, id);
     }
 
+    if (path === "/api/blocked-senders" && method === "GET") {
+      return await handleListBlockedSenders(req, res);
+    }
+
+    if (path === "/api/blocked-senders" && method === "POST") {
+      return await handleBlockSender(req, res);
+    }
+
+    if (path === "/api/deleted-emails" && method === "GET") {
+      return await handleListDeletedEmails(req, res);
+    }
+
+    if (path.match(/^\/api\/deleted-emails\/[^/]+\/restore$/) && method === "POST") {
+      const id = path.replace("/api/deleted-emails/", "").replace("/restore", "");
+      return await handleRestoreDeletedEmail(req, res, id);
+    }
+
+    if (path.match(/^\/api\/blocked-senders\/[^/]+$/) && method === "DELETE") {
+      const id = path.replace("/api/blocked-senders/", "");
+      return await handleUnblockSender(req, res, id);
+    }
+
     if (path === "/api/emails/send" && method === "POST") {
       return await handleSendEmail(req, res);
     }
@@ -142,6 +208,7 @@ async function handleListEmails(req, res) {
   const skip = (page - 1) * limit;
   const search = query.search || "";
   const mailbox = query.mailbox || "";
+  const mailboxType = query.mailboxType || "";
 
   const where = {};
 
@@ -154,6 +221,17 @@ async function handleListEmails(req, res) {
 
   if (mailbox) {
     where.mailbox = mailbox;
+  } else if (mailboxType) {
+    const mailboxCandidates =
+      mailboxType === "sent"
+        ? env.IMAP_SENT_MAILBOXES
+        : mailboxType === "spam"
+          ? env.IMAP_SPAM_MAILBOXES
+          : env.IMAP_MAILBOXES;
+
+    where.mailbox = {
+      in: mailboxCandidates.length > 0 ? mailboxCandidates : [env.IMAP_MAILBOX],
+    };
   }
 
   const [emails, total] = await Promise.all([
@@ -182,6 +260,7 @@ async function handleListEmails(req, res) {
     messageId: email.messageId,
     uid: email.uid,
     mailbox: email.mailbox,
+    mailboxType: classifyMailbox(email.mailbox),
     subject: email.subject,
     from: email.fromAddresses,
     to: email.toAddresses,
@@ -234,6 +313,7 @@ async function handleGetEmail(req, res, id) {
     messageId: email.messageId,
     uid: email.uid,
     mailbox: email.mailbox,
+    mailboxType: classifyMailbox(email.mailbox),
     subject: email.subject,
     from: email.fromAddresses,
     to: email.toAddresses,
@@ -360,6 +440,9 @@ async function handleDeleteEmail(req, res, id) {
     return sendJson(res, 503, { error: "Database not available" });
   }
 
+  const body = await parseBody(req).catch(() => ({}));
+  const deletedBy = normalizeViewer(body);
+
   const email = await prisma.emailMessage.findUnique({
     where: { id },
     include: {
@@ -371,8 +454,7 @@ async function handleDeleteEmail(req, res, id) {
     return sendJson(res, 404, { error: "Email not found" });
   }
 
-  await removeStoredAttachments(email.attachments);
-
+  await registerDeletedEmail(email, deletedBy);
   await prisma.emailMessage.delete({
     where: { id },
   });
@@ -404,6 +486,53 @@ async function handleDownloadAttachment(req, res, id) {
     "Content-Disposition": `attachment; filename="${safeFilename}"; filename*=UTF-8''${encodedFilename}`,
   });
   res.end(body);
+}
+
+async function handleListBlockedSenders(req, res) {
+  const blocked = await listBlockedSenders();
+  sendJson(res, 200, {
+    blockedSenders: blocked.map(mapBlockedSender),
+  });
+}
+
+async function handleListDeletedEmails(req, res) {
+  const deleted = await listDeletedEmails();
+  sendJson(res, 200, {
+    deletedEmails: deleted.map(mapDeletedEmail),
+  });
+}
+
+async function handleRestoreDeletedEmail(req, res, id) {
+  const restored = await restoreDeletedEmail(id);
+  sendJson(res, 200, {
+    success: true,
+    deletedEmail: restored ? mapDeletedEmail(restored) : null,
+  });
+}
+
+async function handleBlockSender(req, res) {
+  const body = await parseBody(req);
+  const email = typeof body.email === "string" ? body.email.trim() : "";
+  const reason = typeof body.reason === "string" ? body.reason.trim() : null;
+  const blockedBy = normalizeViewer(body);
+
+  if (!email) {
+    return sendJson(res, 400, { error: "Email do remetente é obrigatório" });
+  }
+
+  const blocked = await blockSender(email, blockedBy, reason);
+  sendJson(res, 200, {
+    success: true,
+    blockedSender: mapBlockedSender(blocked),
+  });
+}
+
+async function handleUnblockSender(req, res, id) {
+  const blocked = await unblockSender(id);
+  sendJson(res, 200, {
+    success: true,
+    blockedSender: mapBlockedSender(blocked),
+  });
 }
 
 async function handleSendEmail(req, res) {
@@ -450,6 +579,7 @@ async function handleGetStats(req, res) {
     return sendJson(res, 503, { error: "Database not available" });
   }
 
+  const inboxMailboxes = env.IMAP_MAILBOXES.length > 0 ? env.IMAP_MAILBOXES : [env.IMAP_MAILBOX];
   const [totalEmails, totalAttachments, todayEmails, unreadEmails] = await Promise.all([
     prisma.emailMessage.count(),
     prisma.emailAttachment.count(),
@@ -463,6 +593,9 @@ async function handleGetStats(req, res) {
     prisma.emailMessage.count({
       where: {
         isRead: false,
+        mailbox: {
+          in: inboxMailboxes,
+        },
       },
     }),
   ]);
@@ -475,7 +608,6 @@ async function handleGetStats(req, res) {
   });
 }
 
-// Armazena os webhooks registrados
 const webhooks = new Set();
 
 async function handleRegisterWebhook(req, res) {
