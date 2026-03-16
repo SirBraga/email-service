@@ -109,6 +109,35 @@ function parseBooleanQuery(value) {
   return null;
 }
 
+function isRecord(value) {
+  return typeof value === "object" && value !== null;
+}
+
+function getNonEmptyString(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function extractInternalSender(rawPayload) {
+  if (!isRecord(rawPayload)) {
+    return {
+      sentByUserId: null,
+      sentByUserName: null,
+      sentByUserEmail: null,
+    };
+  }
+
+  const metadata = isRecord(rawPayload.metadata) ? rawPayload.metadata : null;
+  const internalSender = metadata && isRecord(metadata.internalSender)
+    ? metadata.internalSender
+    : null;
+
+  return {
+    sentByUserId: getNonEmptyString(internalSender?.userId),
+    sentByUserName: getNonEmptyString(internalSender?.userName),
+    sentByUserEmail: getNonEmptyString(internalSender?.userEmail),
+  };
+}
+
 function resolveEmailFilters(query) {
   const filter = typeof query.filter === "string" ? query.filter.trim().toLowerCase() : "";
   const read = typeof query.read === "string" ? query.read.trim().toLowerCase() : "";
@@ -384,6 +413,7 @@ async function handleListEmails(req, res) {
   const effectiveTotal = shouldFilterByBlocked ? filteredEmails.length : total;
 
   const formatted = paginatedEmails.map((email) => ({
+    ...extractInternalSender(email.rawPayload),
     id: email.id,
     messageId: email.messageId,
     uid: email.uid,
@@ -450,6 +480,7 @@ async function handleGetEmail(req, res, id) {
     : null;
 
   sendJson(res, 200, {
+    ...extractInternalSender(email.rawPayload),
     id: email.id,
     messageId: email.messageId,
     uid: email.uid,
